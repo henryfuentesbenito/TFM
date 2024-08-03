@@ -62,7 +62,7 @@ if __name__ == '__main__':
     args = parser.parse_args()
     np.random.seed(1)
 
-    # Supongamos que tus datos ya están almacenados en archivos
+    
     train_path = os.path.join(args.output_dir, 'train_feats')
     val_path = os.path.join(args.output_dir, 'val_feats')
     test_path = os.path.join(args.output_dir, 'test_feats')
