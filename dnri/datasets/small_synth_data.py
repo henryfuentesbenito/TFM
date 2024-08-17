@@ -93,7 +93,7 @@ if __name__ == '__main__':
     
     T = args.num_time_steps  # Número de pasos de tiempo por trayectoria
     N = 3  # Número de trayectorias
-    L = 1.5 * 12  # Tamaño de la caja (en píxeles)
+    L = 1.5 * 128  # Tamaño de la caja (en píxeles)
     D = 0.1  # Coeficiente de difusión (en píxeles^2 / frame)
     alphas = [1.0, 0.9]  # Exponentes anómalos
     Ds = [10 * D, 1.0 * D]  # Coeficientes de difusión
