@@ -242,7 +242,7 @@ class DNRI_DynamicVars_Encoder(nn.Module):
             current_x, current_state = self.reverse_rnn(current_x, current_state)
 
             reverse_state[0][:, global_edge_inds] = current_state[0]
-            reverse_state[1][:[:, global_edge_inds]] = current_state[1]
+            reverse_state[1][:, global_edge_inds] = current_state[1]
             all_reverse_states.append(current_state[0])
         all_forward_states = torch.cat(all_forward_states, dim=1)
         all_reverse_states = torch.cat(all_reverse_states, dim=1).flip(1)
