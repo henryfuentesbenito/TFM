@@ -6,7 +6,6 @@ from . import train_utils
 import dnri.utils.misc as misc
 
 import time, os
-
 import random
 import numpy as np
 
@@ -36,27 +35,11 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
     normalize_inputs = params['normalize_inputs']
     num_decoder_samples = 1
     train_data_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, drop_last=True, collate_fn=collate_fn)
-    print("NUM BATCHES: ", len(train_data_loader))
+    print("NUM BATCHES: ",len(train_data_loader))
     val_data_loader = DataLoader(val_data, batch_size=val_batch_size, collate_fn=collate_fn)
     lr = params['lr']
     wd = params.get('wd', 0.)
     mom = params.get('mom', 0.)
-    
-    # Calcular las frecuencias de las clases al inicio del entrenamiento
-    frecuencia_de_clase_0 = 0
-    frecuencia_de_clase_1 = 0
-    for batch in train_data_loader:
-        targets = batch['edges'].long()  # Suponiendo que 'edges' contiene las etiquetas de clases
-        frecuencia_de_clase_0 += (targets == 0).sum().item()
-        frecuencia_de_clase_1 += (targets == 1).sum().item()
-
-    total = frecuencia_de_clase_0 + frecuencia_de_clase_1
-    weight_for_class_0 = total / (2 * frecuencia_de_clase_0)
-    weight_for_class_1 = total / (2 * frecuencia_de_clase_1)
-    weights = torch.tensor([weight_for_class_0, weight_for_class_1], dtype=torch.float32)
-
-    # Crear la función de pérdida con los pesos calculados
-    criterion = nn.CrossEntropyLoss(weight=weights.cuda() if gpu else weights)
     
     model_params = [param for param in model.parameters() if param.requires_grad]
     if params.get('use_adam', False):
@@ -77,7 +60,7 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         best_val_result = train_params['best_val_result']
         best_val_epoch = train_params['best_val_epoch']
         model.steps = train_params['step']
-        print("STARTING EPOCH: ", start_epoch)
+        print("STARTING EPOCH: ",start_epoch)
     else:
         start_epoch = 1
         best_val_epoch = -1
@@ -86,6 +69,20 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
     training_scheduler = train_utils.build_scheduler(opt, params)
     end = start = 0 
     misc.seed(1)
+    
+    # Calcular las frecuencias de las clases (Ejemplo)
+    # Supongamos que tienes estas frecuencias:
+    frecuencia_de_clase_0 = 0.9  # Frecuencia de la clase 0
+    frecuencia_de_clase_1 = 0.1  # Frecuencia de la clase 1
+
+    # Calcular los pesos inversamente proporcionales a las frecuencias
+    peso_clase_0 = 1 / frecuencia_de_clase_0
+    peso_clase_1 = 1 / frecuencia_de_clase_1
+
+    # Crear un tensor de pesos para la función de pérdida
+    pesos = torch.tensor([peso_clase_0, peso_clase_1]).to('cuda' if gpu else 'cpu')
+    criterion = torch.nn.CrossEntropyLoss(weight=pesos)
+
     for epoch in range(start_epoch, num_epochs+1):
         model.epoch = epoch
         print("EPOCH", epoch, (end-start))
@@ -102,34 +99,36 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
                 inputs = inputs.cuda(non_blocking=True)
                 if masks is not None:
                     masks = masks.cuda(non_blocking=True)
-            args = {'is_train': True, 'return_logits': True}
+            args = {'is_train':True, 'return_logits':True}
             sub_steps = len(range(0, batch_size, sub_batch_size))
             for sub_batch_ind in range(0, batch_size, sub_batch_size):
-                sub_inputs = inputs[sub_batch_ind:sub_batch_ind + sub_batch_size]
+                sub_inputs = inputs[sub_batch_ind:sub_batch_ind+sub_batch_size]
                 for sample in range(num_decoder_samples):
                     if normalize_inputs:
                         if masks is not None:
                             normalized_inputs = model.normalize_inputs(inputs[:, :-1], masks[:, :-1])
                         else:
                             normalized_inputs = model.normalize_inputs(inputs[:, :-1])
-                        args['normalized_inputs'] = normalized_inputs[sub_batch_ind:sub_batch_ind + sub_batch_size]
+                        args['normalized_inputs'] = normalized_inputs[sub_batch_ind:sub_batch_ind+sub_batch_size]
                     if masks is not None:
-                        sub_masks = masks[sub_batch_ind:sub_batch_ind + sub_batch_size]
-                        sub_node_inds = node_inds[sub_batch_ind:sub_batch_ind + sub_batch_size]
-                        sub_graph_info = graph_info[sub_batch_ind:sub_batch_ind + sub_batch_size]
+                        sub_masks = masks[sub_batch_ind:sub_batch_ind+sub_batch_size]
+                        sub_node_inds = node_inds[sub_batch_ind:sub_batch_ind+sub_batch_size]
+                        sub_graph_info = graph_info[sub_batch_ind:sub_batch_ind+sub_batch_size]
                         loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(sub_inputs, sub_masks, sub_node_inds, sub_graph_info, **args)
                     else:
                         loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(sub_inputs, **args)
                     
-                    # Aplicar la pérdida ponderada
-                    loss = criterion(logits.view(-1, logits.size(-1)), batch['edges'].view(-1)) / (sub_steps * accumulate_steps * num_decoder_samples)
+                    # Aplicar los pesos en la función de pérdida
+                    weighted_loss = criterion(logits.view(-1, logits.size(-1)), sub_graph_info.view(-1))
+                    
+                    loss = weighted_loss / (sub_steps*accumulate_steps*num_decoder_samples)
                     loss.backward()
                 
                 if verbose:
-                    tmp_batch_ind = batch_ind * sub_steps + sub_batch_ind + 1
-                    tmp_total_batch = len(train_data_loader) * sub_steps
-                    print("\tBATCH %d OF %d: %f, %f, %f" % (tmp_batch_ind, tmp_total_batch, loss.item(), loss_nll.mean().item(), loss_kl.mean().item()))
-            if accumulate_steps == -1 or (batch_ind + 1) % accumulate_steps == 0:
+                    tmp_batch_ind = batch_ind*sub_steps + sub_batch_ind + 1
+                    tmp_total_batch = len(train_data_loader)*sub_steps
+                    print("\tBATCH %d OF %d: %f, %f, %f"%(tmp_batch_ind, tmp_total_batch, loss.item(), loss_nll.mean().item(), loss_kl.mean().item()))
+            if accumulate_steps == -1 or (batch_ind+1)%accumulate_steps == 0:
                 if verbose and accumulate_steps > 0:
                     print("\tUPDATING WEIGHTS")
                 if clip_grad is not None:
@@ -146,14 +145,14 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
             training_scheduler.step()
         
         if train_writer is not None:
-            train_writer.add_scalar('loss', loss.item() * (sub_steps * accumulate_steps * num_decoder_samples), global_step=epoch)
+            train_writer.add_scalar('loss', loss.item()*(sub_steps*accumulate_steps*num_decoder_samples), global_step=epoch)
             if normalize_nll:
                 train_writer.add_scalar('NLL', loss_nll.mean().item(), global_step=epoch)
             else:
-                train_writer.add_scalar('NLL', loss_nll.mean().item() / (inputs.size(1) * inputs.size(2)), global_step=epoch)
+                train_writer.add_scalar('NLL', loss_nll.mean().item()/(inputs.size(1)*inputs.size(2)), global_step=epoch)
             
             train_writer.add_scalar("KL Divergence", loss_kl.mean().item(), global_step=epoch)
-        if (epoch + 1) % val_interval != 0:
+        if ((epoch+1)%val_interval != 0):
             end = time.time()
             continue
         model.eval()
@@ -179,11 +178,11 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
                 total_kl += loss_kl.sum().item()
                 total_nll += loss_nll.sum().item()
             if verbose:
-                print("\tVAL BATCH %d of %d: %f, %f" % (batch_ind + 1, len(val_data_loader), loss_nll.mean(), loss_kl.mean()))
+                print("\tVAL BATCH %d of %d: %f, %f"%(batch_ind+1, len(val_data_loader), loss_nll.mean(), loss_kl.mean()))
             
         total_kl /= len(val_data)
         total_nll /= len(val_data)
-        total_loss = model.kl_coef * total_kl + total_nll
+        total_loss = model.kl_coef*total_kl + total_nll
         if val_writer is not None:
             val_writer.add_scalar('loss', total_loss, global_step=epoch)
             val_writer.add_scalar("NLL", total_nll, global_step=epoch)
@@ -200,14 +199,15 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
             model.save(best_path)
         model.save(checkpoint_dir)
         torch.save({
-                    'epoch': epoch + 1,
-                    'optimizer': opt.state_dict(),
-                    'best_val_result': best_val_result,
-                    'best_val_epoch': best_val_epoch,
-                    'step': model.steps,
+                    'epoch':epoch+1,
+                    'optimizer':opt.state_dict(),
+                    'best_val_result':best_val_result,
+                    'best_val_epoch':best_val_epoch,
+                    'step':model.steps,
                    }, training_path)
-        print("EPOCH %d EVAL: " % epoch)
-        print("\tCURRENT VAL LOSS: %f" % tuning_loss)
-        print("\tBEST VAL LOSS:    %f" % best_val_result)
+        print("EPOCH %d EVAL: "%epoch)
+        print("\tCURRENT VAL LOSS: %f"%tuning_loss)
+        print("\tBEST VAL LOSS:    %f"%best_val_result)
+        print("\tBEST VAL EPOCH:   %d"%best_val_epoch)
         
         end = time.time()
