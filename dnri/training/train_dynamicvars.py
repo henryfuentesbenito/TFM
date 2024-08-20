@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.utils.tensorboard import SummaryWriter
 from . import train_utils
 import dnri.utils.misc as misc
@@ -34,7 +34,13 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
     continue_training = params.get('continue_training', False)
     normalize_inputs = params['normalize_inputs']
     num_decoder_samples = 1
-    train_data_loader = DataLoader(train_data, batch_size=batch_size, shuffle=True, drop_last=True, collate_fn=collate_fn)
+
+    # Balance de clases en los datos (opcional)
+    class_weights = [1.0 / frecuencia_de_clase_0, 1.0 / frecuencia_de_clase_1]
+    sample_weights = [class_weights[int(label)] for label in train_data.labels]
+    sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
+
+    train_data_loader = DataLoader(train_data, batch_size=batch_size, sampler=sampler, drop_last=True, collate_fn=collate_fn)
     print("NUM BATCHES: ",len(train_data_loader))
     val_data_loader = DataLoader(val_data, batch_size=val_batch_size, collate_fn=collate_fn)
     lr = params['lr']
@@ -70,10 +76,9 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
     end = start = 0 
     misc.seed(1)
     
-    # Calcular las frecuencias de las clases (Ejemplo)
-    # Supongamos que tienes estas frecuencias:
-    frecuencia_de_clase_0 = 0.9  # Frecuencia de la clase 0
-    frecuencia_de_clase_1 = 0.1  # Frecuencia de la clase 1
+    # Calcular las frecuencias de las clases
+    frecuencia_de_clase_0 = 0.9  # Ajusta este valor basado en la distribución de tus datos
+    frecuencia_de_clase_1 = 0.1  # Ajusta este valor basado en la distribución de tus datos
 
     # Calcular los pesos inversamente proporcionales a las frecuencias
     peso_clase_0 = 1 / frecuencia_de_clase_0
@@ -117,11 +122,11 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
                         loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(sub_inputs, sub_masks, sub_node_inds, sub_graph_info, **args)
                     else:
                         loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(sub_inputs, **args)
-                    
-                    # Aplicar los pesos en la función de pérdida
-                    weighted_loss = criterion(logits.view(-1, logits.size(-1)), sub_graph_info.view(-1))
-                    
-                    loss = weighted_loss / (sub_steps*accumulate_steps*num_decoder_samples)
+
+                    # Aplicar la pérdida ponderada
+                    weighted_loss = criterion(logits.view(-1, logits.size(-1)), sub_masks.view(-1))
+                    weighted_loss.backward()
+                    loss = loss / (sub_steps*accumulate_steps*num_decoder_samples)
                     loss.backward()
                 
                 if verbose:
@@ -211,3 +216,4 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         print("\tBEST VAL EPOCH:   %d"%best_val_epoch)
         
         end = time.time()
+
