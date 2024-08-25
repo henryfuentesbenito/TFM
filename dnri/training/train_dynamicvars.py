@@ -77,8 +77,8 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
     misc.seed(1)
     
     # Calcular las frecuencias de las clases
-    frecuencia_de_clase_0 = 0.8  # Ajusta este valor basado en la distribución de tus datos
-    frecuencia_de_clase_1 = 0.2  # Ajusta este valor basado en la distribución de tus datos
+    frecuencia_de_clase_0 = 0.9  # Ajusta este valor basado en la distribución de tus datos
+    frecuencia_de_clase_1 = 0.1  # Ajusta este valor basado en la distribución de tus datos
 
     # Calcular los pesos inversamente proporcionales a las frecuencias
     peso_clase_0 = 1 / frecuencia_de_clase_0
