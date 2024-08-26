@@ -14,15 +14,15 @@ class GraphRNNDecoder(nn.Module):
         self.gpu = params['gpu']
         self.dropout_prob = params['decoder_dropout']
 
-        # GRU layer
-        self.gru = nn.GRU(input_size=self.input_size, hidden_size=self.hidden_size, batch_first=True)
+        # LSTM layer
+        self.lstm = nn.LSTM(input_size=self.input_size, hidden_size=self.hidden_size, batch_first=True)
 
         # Fully connected layers for output
         self.out_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
         self.out_fc2 = nn.Linear(self.hidden_size, self.hidden_size)
         self.out_fc3 = nn.Linear(self.hidden_size, self.input_size)
 
-        print('Using GRU-based decoder.')
+        print('Using LSTM-based decoder.')
 
         # Initialize edge-to-node matrix
         edges = np.ones(self.num_vars) - np.eye(self.num_vars)
@@ -32,12 +32,13 @@ class GraphRNNDecoder(nn.Module):
         if self.gpu:
             self.edge2node_mat = self.edge2node_mat.cuda(non_blocking=True)
 
-    def single_step_forward(self, inputs, hidden):
+    def single_step_forward(self, inputs, hidden, cell_state):
         # Inputs: [batch, num_atoms, num_dims]
         # Hidden: [batch, num_atoms, hidden_size]
+        # Cell State: [batch, num_atoms, hidden_size]
 
-        # Process each node with GRU
-        pred, hidden = self.gru(inputs.unsqueeze(1), hidden)
+        # Process each node with LSTM
+        pred, (hidden, cell_state) = self.lstm(inputs.unsqueeze(1), (hidden, cell_state))
 
         # Reshape prediction back to [batch, num_atoms, num_dims]
         pred = pred.squeeze(1)
@@ -50,7 +51,7 @@ class GraphRNNDecoder(nn.Module):
         # Skip connection
         pred = inputs + pred
 
-        return pred, hidden
+        return pred, hidden, cell_state
 
     def forward(self, inputs, sampled_edges, teacher_forcing=False, teacher_forcing_steps=-1, return_state=False,
                 prediction_steps=-1, state=None, burn_in_masks=None):
@@ -65,10 +66,12 @@ class GraphRNNDecoder(nn.Module):
         if state is None:
             if inputs.is_cuda:
                 hidden = torch.cuda.FloatTensor(1, inputs.size(0) * self.num_vars, self.hidden_size).fill_(0.)
+                cell_state = torch.cuda.FloatTensor(1, inputs.size(0) * self.num_vars, self.hidden_size).fill_(0.)
             else:
                 hidden = torch.zeros(1, inputs.size(0) * self.num_vars, self.hidden_size)
+                cell_state = torch.zeros(1, inputs.size(0) * self.num_vars, self.hidden_size)
         else:
-            hidden = state
+            hidden, cell_state = state
 
         if teacher_forcing_steps == -1:
             teacher_forcing_steps = inputs.size(1)
@@ -83,13 +86,13 @@ class GraphRNNDecoder(nn.Module):
             else:
                 ins = pred_all[-1]
 
-            pred, hidden = self.single_step_forward(ins, hidden)
+            pred, hidden, cell_state = self.single_step_forward(ins, hidden, cell_state)
 
             pred_all.append(pred)
 
         preds = torch.stack(pred_all, dim=1)
 
         if return_state:
-            return preds, hidden
+            return preds, (hidden, cell_state)
         else:
             return preds
