@@ -8,6 +8,7 @@ import numpy as np
 from .model_utils import encode_onehot, RefNRIMLP
 
 class BaseEncoder(nn.Module):
+
     def __init__(self, num_vars, graph_type):
         super(BaseEncoder, self).__init__()
         self.num_vars = num_vars
@@ -36,7 +37,7 @@ class BaseEncoder(nn.Module):
             incoming = torch.matmul(self.edge2node_mat, tmp_embeddings).view(old_shape[0], -1, old_shape[2], old_shape[3])
         else:
             incoming = torch.matmul(self.edge2node_mat, edge_embeddings)
-        return incoming/(self.num_vars-1)
+        return incoming / (self.num_vars - 1)
 
     def forward(self, inputs, state=None, return_state=False):
         raise NotImplementedError
@@ -55,15 +56,15 @@ class RefMLPEncoder(BaseEncoder):
         self.dynamic = self.graph_type == 'dynamic'
         self.factor = factor
 
-        # GRU layer
-        self.gru = nn.GRU(input_size=inp_size, hidden_size=hidden_size, batch_first=True)
+        # LSTM layer
+        self.lstm = nn.LSTM(input_size=inp_size, hidden_size=hidden_size, batch_first=True)
 
         if self.factor:
             self.mlp4 = RefNRIMLP(hidden_size * 3, hidden_size, hidden_size, dropout, no_bn=False)
-            print("Using factor graph GRU encoder.")
+            print("Using factor graph LSTM encoder.")
         else:
             self.mlp4 = RefNRIMLP(hidden_size * 2, hidden_size, hidden_size, dropout, no_bn=False)
-            print("Using GRU encoder.")
+            print("Using LSTM encoder.")
 
         num_layers = params['encoder_mlp_num_layers']
         if num_layers == 1:
@@ -98,8 +99,8 @@ class RefMLPEncoder(BaseEncoder):
         if state is not None:
             inputs = torch.cat([state, inputs], 1)[:, -self.input_time_steps:]
 
-        # Pass through GRU
-        x, hidden = self.gru(inputs)
+        # Pass through LSTM
+        x, (hidden, cell) = self.lstm(inputs)
 
         # Combine node embeddings to form edge embeddings
         x = self.node2edge(x)
@@ -117,6 +118,6 @@ class RefMLPEncoder(BaseEncoder):
 
         result_dict = {
             'logits': result,
-            'state': hidden if return_state else None,
+            'state': (hidden, cell) if return_state else None,
         }
         return result_dict
