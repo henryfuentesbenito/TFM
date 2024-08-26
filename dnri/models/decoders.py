@@ -1,106 +1,53 @@
 import torch
 from torch import nn
-from torch.nn import init
 import torch.nn.functional as F
 import numpy as np
-
-from .model_utils import encode_onehot 
-
+from torch.nn import init
+from .model_utils import encode_onehot
 
 class GraphRNNDecoder(nn.Module):
     def __init__(self, params):
-        super(GraphRNNDecoder, self).__init__()
-        self.embedder = None
-        self.num_vars = num_vars =  params['num_vars']
-        input_size = params['input_size']
+        super(GRUDecoder, self).__init__()
+        self.num_vars = params['num_vars']
+        self.input_size = params['input_size']
+        self.hidden_size = params['decoder_hidden']
         self.gpu = params['gpu']
-        n_hid = params['decoder_hidden']
-        edge_types = params['num_edge_types']
-        skip_first = params['skip_first']
-        out_size = params['input_size']
-        do_prob = params['decoder_dropout']
+        self.dropout_prob = params['decoder_dropout']
 
-        # Define attention layer
-        self.attention = nn.Linear(2 * n_hid, 1)
+        # GRU layer
+        self.gru = nn.GRU(input_size=self.input_size, hidden_size=self.hidden_size, batch_first=True)
 
-        self.msg_fc1 = nn.ModuleList(
-            [nn.Linear(2*n_hid, n_hid) for _ in range(edge_types)]
-        )
-        self.msg_fc2 = nn.ModuleList(
-            [nn.Linear(n_hid, n_hid) for _ in range(edge_types)]
-        )
-        self.msg_out_shape = n_hid
-        self.skip_first_edge_type = skip_first
+        # Fully connected layers for output
+        self.out_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
+        self.out_fc2 = nn.Linear(self.hidden_size, self.hidden_size)
+        self.out_fc3 = nn.Linear(self.hidden_size, self.input_size)
 
-        self.hidden_r = nn.Linear(n_hid, n_hid, bias=False)
-        self.hidden_i = nn.Linear(n_hid, n_hid, bias=False)
-        self.hidden_h = nn.Linear(n_hid, n_hid, bias=False)
+        print('Using GRU-based decoder.')
 
-        self.input_r = nn.Linear(input_size, n_hid, bias=True)
-        self.input_i = nn.Linear(input_size, n_hid, bias=True)
-        self.input_n = nn.Linear(input_size, n_hid, bias=True)
-
-        self.out_fc1 = nn.Linear(n_hid, n_hid)
-        self.out_fc2 = nn.Linear(n_hid, n_hid)
-        self.out_fc3 = nn.Linear(n_hid, out_size)
-
-        print('Using learned recurrent interaction net decoder with attention.')
-
-        self.dropout_prob = do_prob
-
-        self.num_vars = num_vars
-        edges = np.ones(num_vars) - np.eye(num_vars)
+        # Initialize edge-to-node matrix
+        edges = np.ones(self.num_vars) - np.eye(self.num_vars)
         self.send_edges = np.where(edges)[0]
         self.recv_edges = np.where(edges)[1]
         self.edge2node_mat = torch.FloatTensor(encode_onehot(self.recv_edges))
         if self.gpu:
             self.edge2node_mat = self.edge2node_mat.cuda(non_blocking=True)
 
-    def single_step_forward(self, inputs, rel_type, hidden):
-        receivers = hidden[:, self.recv_edges, :]
-        senders = hidden[:, self.send_edges, :]
+    def single_step_forward(self, inputs, hidden):
+        # Inputs: [batch, num_atoms, num_dims]
+        # Hidden: [batch, num_atoms, hidden_size]
 
-        pre_msg = torch.cat([receivers, senders], dim=-1)
+        # Process each node with GRU
+        pred, hidden = self.gru(inputs.unsqueeze(1), hidden)
 
-        if inputs.is_cuda:
-            all_msgs = torch.cuda.FloatTensor(pre_msg.size(0), pre_msg.size(1), self.msg_out_shape).fill_(0.)
-        else:
-            all_msgs = torch.zeros(pre_msg.size(0), pre_msg.size(1), self.msg_out_shape)
+        # Reshape prediction back to [batch, num_atoms, num_dims]
+        pred = pred.squeeze(1)
 
-        if self.skip_first_edge_type:
-            start_idx = 1
-            norm = float(len(self.msg_fc2)) - 1
-        else:
-            start_idx = 0
-            norm = float(len(self.msg_fc2))
-
-        for i in range(start_idx, len(self.msg_fc2)):
-            msg = torch.tanh(self.msg_fc1[i](pre_msg))
-            msg = F.dropout(msg, p=self.dropout_prob)
-            msg = torch.tanh(self.msg_fc2[i](msg))
-            msg = msg * rel_type[:, :, i:i+1]
-            
-            # Apply attention
-            attention_weights = torch.sigmoid(self.attention(pre_msg))
-            msg = msg * attention_weights
-            
-            all_msgs += msg / norm
-
-        agg_msgs = all_msgs.transpose(-2, -1).matmul(self.edge2node_mat).transpose(-2, -1)
-        agg_msgs = agg_msgs.contiguous() / (self.num_vars - 1)
-
-        inp_r = self.input_r(inputs).view(inputs.size(0), self.num_vars, -1)
-        inp_i = self.input_i(inputs).view(inputs.size(0), self.num_vars, -1)
-        inp_n = self.input_n(inputs).view(inputs.size(0), self.num_vars, -1)
-        r = torch.sigmoid(inp_r + self.hidden_r(agg_msgs))
-        i = torch.sigmoid(inp_i + self.hidden_i(agg_msgs))
-        n = torch.tanh(inp_n + r * self.hidden_h(agg_msgs))
-        hidden = (1 - i) * n + i * hidden
-
-        pred = F.dropout(F.relu(self.out_fc1(hidden)), p=self.dropout_prob)
+        # Output MLP layers
+        pred = F.dropout(F.relu(self.out_fc1(pred)), p=self.dropout_prob)
         pred = F.dropout(F.relu(self.out_fc2(pred)), p=self.dropout_prob)
         pred = self.out_fc3(pred)
 
+        # Skip connection
         pred = inputs + pred
 
         return pred, hidden
@@ -115,14 +62,11 @@ class GraphRNNDecoder(nn.Module):
         else:
             pred_steps = time_steps
 
-        if len(sampled_edges.shape) == 3:
-            sampled_edges = sampled_edges.unsqueeze(1).expand(sampled_edges.size(0), pred_steps, sampled_edges.size(1), sampled_edges.size(2))
-
         if state is None:
             if inputs.is_cuda:
-                hidden = torch.cuda.FloatTensor(inputs.size(0), inputs.size(2), self.msg_out_shape).fill_(0.)
+                hidden = torch.cuda.FloatTensor(1, inputs.size(0) * self.num_vars, self.hidden_size).fill_(0.)
             else:
-                hidden = torch.zeros(inputs.size(0), inputs.size(2), self.msg_out_shape)
+                hidden = torch.zeros(1, inputs.size(0) * self.num_vars, self.hidden_size)
         else:
             hidden = state
 
@@ -138,10 +82,11 @@ class GraphRNNDecoder(nn.Module):
                 ins = inputs[:, step, :]
             else:
                 ins = pred_all[-1]
-            edges = sampled_edges[:, step, :]
-            pred, hidden = self.single_step_forward(ins, edges, hidden)
+
+            pred, hidden = self.single_step_forward(ins, hidden)
 
             pred_all.append(pred)
+
         preds = torch.stack(pred_all, dim=1)
 
         if return_state:
