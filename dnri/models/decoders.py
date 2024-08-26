@@ -8,50 +8,87 @@ from .model_utils import encode_onehot
 class GraphRNNDecoder(nn.Module):
     def __init__(self, params):
         super(GraphRNNDecoder, self).__init__()
-        self.num_vars = params['num_vars']
-        self.input_size = params['input_size']
-        self.hidden_size = params['decoder_hidden']
+        self.num_vars = num_vars = params['num_vars']
+        input_size = params['input_size']
         self.gpu = params['gpu']
-        self.dropout_prob = params['decoder_dropout']
+        n_hid = params['decoder_hidden']
+        edge_types = params['num_edge_types']
+        skip_first = params['skip_first']
+        out_size = params['input_size']
+        do_prob = params['decoder_dropout']
 
-        # LSTM layer
-        self.lstm = nn.LSTM(input_size=self.input_size, hidden_size=self.hidden_size, batch_first=True)
+        # Transformer configuration
+        self.transformer = nn.Transformer(
+            d_model=n_hid, 
+            nhead=params['num_heads'], 
+            num_encoder_layers=params['num_layers'], 
+            num_decoder_layers=params['num_layers'], 
+            dim_feedforward=params['ffn_dim'],
+            dropout=do_prob
+        )
 
-        # Fully connected layers for output
-        self.out_fc1 = nn.Linear(self.hidden_size, self.hidden_size)
-        self.out_fc2 = nn.Linear(self.hidden_size, self.hidden_size)
-        self.out_fc3 = nn.Linear(self.hidden_size, self.input_size)
+        self.msg_fc1 = nn.ModuleList(
+            [nn.Linear(2*n_hid, n_hid) for _ in range(edge_types)]
+        )
+        self.msg_fc2 = nn.ModuleList(
+            [nn.Linear(n_hid, n_hid) for _ in range(edge_types)]
+        )
+        self.msg_out_shape = n_hid
+        self.skip_first_edge_type = skip_first
 
-        print('Using LSTM-based decoder.')
+        self.input_proj = nn.Linear(input_size, n_hid)
 
-        # Initialize edge-to-node matrix
-        edges = np.ones(self.num_vars) - np.eye(self.num_vars)
+        self.out_fc1 = nn.Linear(n_hid, n_hid)
+        self.out_fc2 = nn.Linear(n_hid, n_hid)
+        self.out_fc3 = nn.Linear(n_hid, out_size)
+
+        print('Using Transformer interaction net decoder.')
+
+        self.dropout_prob = do_prob
+
+        edges = np.ones(num_vars) - np.eye(num_vars)
         self.send_edges = np.where(edges)[0]
         self.recv_edges = np.where(edges)[1]
         self.edge2node_mat = torch.FloatTensor(encode_onehot(self.recv_edges))
         if self.gpu:
             self.edge2node_mat = self.edge2node_mat.cuda(non_blocking=True)
 
-    def single_step_forward(self, inputs, hidden, cell_state):
-        # Inputs: [batch, num_atoms, num_dims]
-        # Hidden: [batch, num_atoms, hidden_size]
-        # Cell State: [batch, num_atoms, hidden_size]
+    def single_step_forward(self, inputs, rel_type, hidden):
+        receivers = hidden[:, self.recv_edges, :]
+        senders = hidden[:, self.send_edges, :]
 
-        # Process each node with LSTM
-        pred, (hidden, cell_state) = self.lstm(inputs.unsqueeze(1), (hidden, cell_state))
+        pre_msg = torch.cat([receivers, senders], dim=-1)
 
-        # Reshape prediction back to [batch, num_atoms, num_dims]
-        pred = pred.squeeze(1)
+        all_msgs = torch.zeros(pre_msg.size(0), pre_msg.size(1), self.msg_out_shape, device=inputs.device)
+        
+        if self.skip_first_edge_type:
+            start_idx = 1
+            norm = float(len(self.msg_fc2)) - 1
+        else:
+            start_idx = 0
+            norm = float(len(self.msg_fc2))
 
-        # Output MLP layers
-        pred = F.dropout(F.relu(self.out_fc1(pred)), p=self.dropout_prob)
+        for i in range(start_idx, len(self.msg_fc2)):
+            msg = torch.tanh(self.msg_fc1[i](pre_msg))
+            msg = F.dropout(msg, p=self.dropout_prob)
+            msg = torch.tanh(self.msg_fc2[i](msg))
+            msg = msg * rel_type[:, :, i:i+1]
+            all_msgs += msg / norm
+
+        agg_msgs = all_msgs.transpose(-2, -1).matmul(self.edge2node_mat).transpose(-2, -1)
+        agg_msgs = agg_msgs.contiguous() / (self.num_vars - 1)
+
+        # Transformer block
+        transformer_input = self.input_proj(inputs)
+        hidden = self.transformer(transformer_input.permute(1, 0, 2), agg_msgs.permute(1, 0, 2)).permute(1, 0, 2)
+
+        pred = F.dropout(F.relu(self.out_fc1(hidden)), p=self.dropout_prob)
         pred = F.dropout(F.relu(self.out_fc2(pred)), p=self.dropout_prob)
         pred = self.out_fc3(pred)
 
-        # Skip connection
         pred = inputs + pred
 
-        return pred, hidden, cell_state
+        return pred, hidden
 
     def forward(self, inputs, sampled_edges, teacher_forcing=False, teacher_forcing_steps=-1, return_state=False,
                 prediction_steps=-1, state=None, burn_in_masks=None):
@@ -63,15 +100,13 @@ class GraphRNNDecoder(nn.Module):
         else:
             pred_steps = time_steps
 
+        if len(sampled_edges.shape) == 3:
+            sampled_edges = sampled_edges.unsqueeze(1).expand(sampled_edges.size(0), pred_steps, sampled_edges.size(1), sampled_edges.size(2))
+
         if state is None:
-            if inputs.is_cuda:
-                hidden = torch.cuda.FloatTensor(1, inputs.size(0) * self.num_vars, self.hidden_size).fill_(0.)
-                cell_state = torch.cuda.FloatTensor(1, inputs.size(0) * self.num_vars, self.hidden_size).fill_(0.)
-            else:
-                hidden = torch.zeros(1, inputs.size(0) * self.num_vars, self.hidden_size)
-                cell_state = torch.zeros(1, inputs.size(0) * self.num_vars, self.hidden_size)
+            hidden = torch.zeros(inputs.size(0), inputs.size(2), self.msg_out_shape, device=inputs.device)
         else:
-            hidden, cell_state = state
+            hidden = state
 
         if teacher_forcing_steps == -1:
             teacher_forcing_steps = inputs.size(1)
@@ -85,14 +120,13 @@ class GraphRNNDecoder(nn.Module):
                 ins = inputs[:, step, :]
             else:
                 ins = pred_all[-1]
-
-            pred, hidden, cell_state = self.single_step_forward(ins, hidden, cell_state)
+            edges = sampled_edges[:, step, :]
+            pred, hidden = self.single_step_forward(ins, edges, hidden)
 
             pred_all.append(pred)
-
         preds = torch.stack(pred_all, dim=1)
 
         if return_state:
-            return preds, (hidden, cell_state)
+            return preds, hidden
         else:
             return preds
