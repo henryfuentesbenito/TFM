@@ -41,7 +41,7 @@ class BaseEncoder(nn.Module):
     def forward(self, inputs, state=None, return_state=False):
         raise NotImplementedError
 
-class RefGRUEncoder(BaseEncoder):
+class RefMLPEncoder(BaseEncoder):
     def __init__(self, params):
         num_vars = params['num_vars']
         inp_size = params['input_size']
