@@ -1,13 +1,13 @@
+
+from torch.nn import init
+
 import torch
 from torch import nn
-from torch.nn import init
 import torch.nn.functional as F
 import numpy as np
 from .model_utils import encode_onehot, RefNRIMLP
 
-
 class BaseEncoder(nn.Module):
-
     def __init__(self, num_vars, graph_type):
         super(BaseEncoder, self).__init__()
         self.num_vars = num_vars
@@ -21,9 +21,6 @@ class BaseEncoder(nn.Module):
     
     def node2edge(self, node_embeddings):
         if self.dynamic:
-            '''
-            node_embeddings: [batch, num_nodes, embed_size]
-            '''
             send_embed = node_embeddings[:, self.send_edges, :, :]
             recv_embed = node_embeddings[:, self.recv_edges, :, :]
             return torch.cat([send_embed, recv_embed], dim=3)
@@ -44,34 +41,30 @@ class BaseEncoder(nn.Module):
     def forward(self, inputs, state=None, return_state=False):
         raise NotImplementedError
 
-
-class RefMLPEncoder(BaseEncoder):
+class RefGRUEncoder(BaseEncoder):
     def __init__(self, params):
         num_vars = params['num_vars']
-        inp_size = inp_size = params['input_size']*params['input_time_steps']
+        inp_size = params['input_size']
         hidden_size = params['encoder_hidden']
         num_edges = params['num_edge_types']
         factor = not params['encoder_no_factor']
-        no_bn = False
         graph_type = params['graph_type']
-        super(RefMLPEncoder, self).__init__(num_vars, graph_type)
+        super(RefGRUEncoder, self).__init__(num_vars, graph_type)
         dropout = params['encoder_dropout']
         self.input_time_steps = params['input_time_steps']
         self.dynamic = self.graph_type == 'dynamic'
         self.factor = factor
-        self.mlp1 = RefNRIMLP(inp_size, hidden_size, hidden_size, dropout, no_bn=no_bn)
-        self.mlp2 = RefNRIMLP(hidden_size * 2, hidden_size, hidden_size, dropout, no_bn=no_bn)
-        self.mlp3 = RefNRIMLP(hidden_size, hidden_size, hidden_size, dropout, no_bn=no_bn)
-        
-        # Implementing attention mechanism
-        self.attention = nn.MultiheadAttention(embed_dim=hidden_size, num_heads=8, dropout=dropout)
+
+        # GRU layer
+        self.gru = nn.GRU(input_size=inp_size, hidden_size=hidden_size, batch_first=True)
 
         if self.factor:
-            self.mlp4 = RefNRIMLP(hidden_size * 3, hidden_size, hidden_size, dropout, no_bn=no_bn)
-            print("Using factor graph MLP encoder with attention.")
+            self.mlp4 = RefNRIMLP(hidden_size * 3, hidden_size, hidden_size, dropout, no_bn=False)
+            print("Using factor graph GRU encoder.")
         else:
-            self.mlp4 = RefNRIMLP(hidden_size * 2, hidden_size, hidden_size, dropout, no_bn=no_bn)
-            print("Using MLP encoder with attention.")
+            self.mlp4 = RefNRIMLP(hidden_size * 2, hidden_size, hidden_size, dropout, no_bn=False)
+            print("Using GRU encoder.")
+
         num_layers = params['encoder_mlp_num_layers']
         if num_layers == 1:
             self.fc_out = nn.Linear(hidden_size, num_edges)
@@ -86,15 +79,6 @@ class RefMLPEncoder(BaseEncoder):
 
         self.init_weights()
 
-    def node2edge(self, node_embeddings):
-        send_embed = node_embeddings[:, self.send_edges, :]
-        recv_embed = node_embeddings[:, self.recv_edges, :]
-        return torch.cat([send_embed, recv_embed], dim=2)
-
-    def edge2node(self, edge_embeddings):
-        incoming = torch.matmul(self.edge2node_mat, edge_embeddings)
-        return incoming/(self.num_vars-1)
-
     def init_weights(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
@@ -108,36 +92,31 @@ class RefMLPEncoder(BaseEncoder):
         if inputs.size(1) > self.input_time_steps:
             inputs = inputs[:, -self.input_time_steps:]
         elif inputs.size(1) < self.input_time_steps:
-            begin_inp = inputs[:, 0:1].expand(-1, self.input_time_steps-inputs.size(1), -1, -1)
+            begin_inp = inputs[:, 0:1].expand(-1, self.input_time_steps - inputs.size(1), -1, -1)
             inputs = torch.cat([begin_inp, inputs], dim=1)
+        
         if state is not None:
             inputs = torch.cat([state, inputs], 1)[:, -self.input_time_steps:]
-        x = inputs.transpose(1, 2).contiguous().view(inputs.size(0), inputs.size(2), -1)
-        # New shape: [num_sims, num_atoms, num_timesteps*num_dims]
-        x = self.mlp1(x)  # 2-layer ELU net per node
 
+        # Pass through GRU
+        x, hidden = self.gru(inputs)
+
+        # Combine node embeddings to form edge embeddings
         x = self.node2edge(x)
-        x = self.mlp2(x)
         x_skip = x
-
-        # Apply attention mechanism here
-        x = x.transpose(0, 1)  # Adjusting for MultiheadAttention input (seq_len, batch, embed_dim)
-        x, _ = self.attention(x, x, x)
-        x = x.transpose(0, 1)
 
         if self.factor:
             x = self.edge2node(x)
-            x = self.mlp3(x)
-            x = self.node2edge(x)
             x = torch.cat((x, x_skip), dim=-1)  # Skip connection
             x = self.mlp4(x)
         else:
-            x = self.mlp3(x)
             x = torch.cat((x, x_skip), dim=-1)  # Skip connection
             x = self.mlp4(x)
-        result =  self.fc_out(x)
+
+        result = self.fc_out(x)
+
         result_dict = {
             'logits': result,
-            'state': inputs,
+            'state': hidden if return_state else None,
         }
         return result_dict
