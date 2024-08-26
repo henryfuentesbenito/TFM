@@ -7,7 +7,7 @@ from .model_utils import encode_onehot
 
 class GraphRNNDecoder(nn.Module):
     def __init__(self, params):
-        super(GRUDecoder, self).__init__()
+        super(GraphRNNDecoder, self).__init__()
         self.num_vars = params['num_vars']
         self.input_size = params['input_size']
         self.hidden_size = params['decoder_hidden']
