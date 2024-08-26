@@ -49,7 +49,7 @@ class RefMLPEncoder(BaseEncoder):
         num_edges = params['num_edge_types']
         factor = not params['encoder_no_factor']
         graph_type = params['graph_type']
-        super(RefGRUEncoder, self).__init__(num_vars, graph_type)
+        super(RefMLPEncoder, self).__init__(num_vars, graph_type)
         dropout = params['encoder_dropout']
         self.input_time_steps = params['input_time_steps']
         self.dynamic = self.graph_type == 'dynamic'
