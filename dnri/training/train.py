@@ -7,6 +7,10 @@ import dnri.utils.misc as misc
 import time, os
 import numpy as np
 
+
+import random
+
+
 def train(model, train_data, val_data, params, train_writer, val_writer):
     gpu = params.get('gpu', False)
     batch_size = params.get('batch_size', 1000)
