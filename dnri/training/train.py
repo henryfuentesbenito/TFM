@@ -64,7 +64,6 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
     misc.seed(1)
     
     # Calcular las frecuencias de las clases (Ejemplo)
-    # Supongamos que tienes estas frecuencias:
     frecuencia_de_clase_0 = 0.9  # Frecuencia de la clase 0
     frecuencia_de_clase_1 = 0.1  # Frecuencia de la clase 1
 
@@ -83,12 +82,19 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         start = time.time() 
         for batch_ind, batch in enumerate(train_data_loader):
             inputs = batch['inputs']
+            targets = batch['edges'].view(-1)  # Aplanar el tensor de destino
+
             if gpu:
                 inputs = inputs.cuda(non_blocking=True)
+                targets = targets.cuda(non_blocking=True)
+            
             loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(inputs, is_train=True, return_logits=True)
+
+            # Ajustar el tamaño de logits para que coincida con el tamaño de los targets
+            logits = logits.view(-1, logits.size(-1))  # Aplanar logits
             
             # Aplicar los pesos en la función de pérdida
-            weighted_loss = criterion(logits.view(-1, logits.size(-1)), batch['edges'].view(-1))
+            weighted_loss = criterion(logits, targets)
             
             weighted_loss.backward()
             if verbose:
@@ -126,9 +132,17 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         with torch.no_grad():
             for batch_ind, batch in enumerate(val_data_loader):
                 inputs = batch['inputs']
+                targets = batch['edges'].view(-1)  # Aplanar el tensor de destino
+                
                 if gpu:
                     inputs = inputs.cuda(non_blocking=True)
+                    targets = targets.cuda(non_blocking=True)
+                
                 loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(inputs, is_train=False, teacher_forcing=val_teacher_forcing, return_logits=True)
+                
+                logits = logits.view(-1, logits.size(-1))  # Aplanar logits
+                weighted_loss = criterion(logits, targets)
+                
                 total_kl += loss_kl.sum().item()
                 total_nll += loss_nll.sum().item()
                 if verbose:
@@ -162,3 +176,4 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         print("\tBEST VAL LOSS:    %f"%best_val_result)
         print("\tBEST VAL EPOCH:   %d"%best_val_epoch)
         end = time.time()
+
