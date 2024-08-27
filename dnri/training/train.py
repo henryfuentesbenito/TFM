@@ -80,6 +80,8 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         model.train()
         model.train_percent = epoch / num_epochs
         start = time.time() 
+        weighted_loss = None  # Inicializa weighted_loss
+        
         for batch_ind, batch in enumerate(train_data_loader):
             inputs = batch['inputs']
             targets = batch['edges'].view(-1)  # Aplanar el tensor de destino
@@ -93,15 +95,16 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
             # Verificar que los logits y targets tengan el mismo tamaño
             logits = logits.view(-1, logits.size(-1))  # Aplanar logits
 
-            # Si todavía hay un desajuste, debes asegurar que se trate de un error de procesamiento de datos
-            if logits.size(0) != targets.size(0):
+            # Si todavía hay un desajuste, deberás ajustar aquí
+            if logits.size(0) == targets.size(0):
+                # Aplicar los pesos en la función de pérdida
+                weighted_loss = criterion(logits, targets)
+                weighted_loss.backward()
+            else:
                 print(f"Warning: logits and targets have mismatched sizes: {logits.size(0)} vs {targets.size(0)}")
-                continue  # Salta este lote si hay un error
-
-            # Aplicar los pesos en la función de pérdida
-            weighted_loss = criterion(logits, targets)
-            
-            weighted_loss.backward()
+                # Puedes omitir el backward y step si hay desajuste
+                continue  
+                
             if verbose:
                 print("\tBATCH %d OF %d: %f, %f, %f"%(batch_ind+1, len(train_data_loader), weighted_loss.item(), loss_nll.mean().item(), loss_kl.mean().item()))
             if accumulate_steps == -1 or (batch_ind+1)%accumulate_steps == 0:
@@ -119,7 +122,7 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         if training_scheduler is not None:
             training_scheduler.step()
         
-        if train_writer is not None:
+        if train_writer is not None and weighted_loss is not None:
             train_writer.add_scalar('loss', weighted_loss.item(), global_step=epoch)
             if normalize_nll:
                 train_writer.add_scalar('NLL', loss_nll.mean().item(), global_step=epoch)
@@ -146,16 +149,14 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
                 loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(inputs, is_train=False, teacher_forcing=val_teacher_forcing, return_logits=True)
                 
                 logits = logits.view(-1, logits.size(-1))  # Aplanar logits
-                if logits.size(0) != targets.size(0):
+                if logits.size(0) == targets.size(0):
+                    weighted_loss = criterion(logits, targets)
+                    total_kl += loss_kl.sum().item()
+                    total_nll += loss_nll.sum().item()
+                    if verbose:
+                        print("\tVAL BATCH %d of %d: %f, %f"%(batch_ind+1, len(val_data_loader), loss_nll.mean(), loss_kl.mean()))
+                else:
                     print(f"Warning: logits and targets have mismatched sizes during validation: {logits.size(0)} vs {targets.size(0)}")
-                    continue
-
-                weighted_loss = criterion(logits, targets)
-                
-                total_kl += loss_kl.sum().item()
-                total_nll += loss_nll.sum().item()
-                if verbose:
-                    print("\tVAL BATCH %d of %d: %f, %f"%(batch_ind+1, len(val_data_loader), loss_nll.mean(), loss_kl.mean()))
             
         total_kl /= len(val_data)
         total_nll /= len(val_data)
@@ -185,5 +186,6 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         print("\tBEST VAL LOSS:    %f"%best_val_result)
         print("\tBEST VAL EPOCH:   %d"%best_val_epoch)
         end = time.time()
+
 
 
