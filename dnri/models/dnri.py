@@ -15,7 +15,7 @@ class DNRI(nn.Module):
         self.num_vars = params['num_vars']
         self.encoder = DNRI_Encoder(params)
         decoder_type = params.get('decoder_type', None)
-        if decoder_type == 'ref_mlp':
+        if (decoder_type == 'ref_mlp'):
             self.decoder = DNRI_MLP_Decoder(params)
         else:
             self.decoder = DNRI_Decoder(params)
@@ -41,7 +41,7 @@ class DNRI(nn.Module):
         if self.add_uniform_prior:
             if params.get('no_edge_prior') is not None:
                 prior = np.zeros(self.num_edge_types)
-                prior.fill((1 - params['no_edge_prior'])/(self.num_edge_types - 1))
+                prior.fill((1 - params['no_edge_prior']) / (self.num_edge_types - 1))
                 prior[0] = params['no_edge_prior']
                 log_prior = torch.FloatTensor(np.log(prior))
                 log_prior = torch.unsqueeze(log_prior, 0)
@@ -49,11 +49,11 @@ class DNRI(nn.Module):
                 if params['gpu']:
                     log_prior = log_prior.cuda(non_blocking=True)
                 self.log_prior = log_prior
-                print("USING NO EDGE PRIOR: ",self.log_prior)
+                print("USING NO EDGE PRIOR: ", self.log_prior)
             else:
                 print("USING UNIFORM PRIOR")
                 prior = np.zeros(self.num_edge_types)
-                prior.fill(1.0/self.num_edge_types)
+                prior.fill(1.0 / self.num_edge_types)
                 log_prior = torch.FloatTensor(np.log(prior))
                 log_prior = torch.unsqueeze(log_prior, 0)
                 log_prior = torch.unsqueeze(log_prior, 0)
@@ -70,7 +70,8 @@ class DNRI(nn.Module):
         predictions, decoder_hidden = self.decoder(inputs, decoder_hidden, edges)
         return predictions, decoder_hidden, edges
 
-    def calculate_loss(self, inputs, is_train=False, teacher_forcing=True, return_edges=False, return_logits=False, use_prior_logits=False):
+    # Modificación aquí para aceptar 'weight'
+    def calculate_loss(self, inputs, is_train=False, teacher_forcing=True, return_edges=False, return_logits=False, use_prior_logits=False, weight=None):
         decoder_hidden = self.decoder.get_initial_hidden(inputs)
         num_time_steps = inputs.size(1)
         all_edges = []
@@ -96,12 +97,14 @@ class DNRI(nn.Module):
             all_edges.append(edges)
         all_predictions = torch.stack(all_predictions, dim=1)
         target = inputs[:, 1:, :, :]
-        loss_nll = self.nll(all_predictions, target)
+        
+        # Modificación para usar 'weight' en la pérdida NLL
+        loss_nll = self.nll(all_predictions, target, weight)
         prob = F.softmax(posterior_logits, dim=-1)
         loss_kl = self.kl_categorical_learned(prob, prior_logits)
         if self.add_uniform_prior:
-            loss_kl = 0.5*loss_kl + 0.5*self.kl_categorical_avg(prob)
-        loss = loss_nll + self.kl_coef*loss_kl
+            loss_kl = 0.5 * loss_kl + 0.5 * self.kl_categorical_avg(prob)
+        loss = loss_nll + self.kl_coef * loss_kl
         loss = loss.mean()
 
         if return_edges:
@@ -154,7 +157,7 @@ class DNRI(nn.Module):
             return torch.cat(hidden, dim=0)
 
     def predict_future_fixedwindow(self, inputs, burn_in_steps, prediction_steps, batch_size, return_edges=False):
-        print("INPUT SHAPE: ",inputs.shape)
+        print("INPUT SHAPE: ", inputs.shape)
         prior_logits, _, prior_hidden = self.encoder(inputs[:, :-1])
         decoder_hidden = self.decoder.get_initial_hidden(inputs)
         for step in range(burn_in_steps-1):
@@ -197,16 +200,16 @@ class DNRI(nn.Module):
             all_timestep_preds.append(torch.stack(current_timestep_preds, dim=1))
             if return_edges:
                 all_timestep_edges.append(torch.stack(current_timestep_edges, dim=1))
-        result =  torch.cat(all_timestep_preds, dim=0)
+        result = torch.cat(all_timestep_preds, dim=0)
         if return_edges:
             edge_result = torch.cat(all_timestep_edges, dim=0)
             return result.unsqueeze(0), edge_result.unsqueeze(0)
         else:
             return result.unsqueeze(0)
 
-    def nll(self, preds, target):
+    def nll(self, preds, target, weight=None):
         if self.nll_loss_type == 'crossent':
-            return self.nll_crossent(preds, target)
+            return self.nll_crossent(preds, target, weight)
         elif self.nll_loss_type == 'gaussian':
             return self.nll_gaussian(preds, target)
         elif self.nll_loss_type == 'poisson':
@@ -224,11 +227,12 @@ class DNRI(nn.Module):
             return neg_log_p.view(target.size(0), -1).sum() / (target.size(1))
 
 
-    def nll_crossent(self, preds, target):
+    # Modificación para pasar weight a la función de pérdida de entropía cruzada
+    def nll_crossent(self, preds, target, weight=None):
         if self.normalize_nll:
-            return nn.BCEWithLogitsLoss(reduction='none')(preds, target).view(preds.size(0), -1).mean(dim=1)
+            return nn.BCEWithLogitsLoss(reduction='none', weight=weight)(preds, target).view(preds.size(0), -1).mean(dim=1)
         else:
-            return nn.BCEWithLogitsLoss(reduction='none')(preds, target).view(preds.size(0), -1).sum(dim=1)
+            return nn.BCEWithLogitsLoss(reduction='none', weight=weight)(preds, target).view(preds.size(0), -1).sum(dim=1)
 
     def nll_poisson(self, preds, target):
         if self.normalize_nll:
@@ -238,7 +242,7 @@ class DNRI(nn.Module):
 
     def kl_categorical_learned(self, preds, prior_logits):
         log_prior = nn.LogSoftmax(dim=-1)(prior_logits)
-        kl_div = preds*(torch.log(preds + 1e-16) - log_prior)
+        kl_div = preds * (torch.log(preds + 1e-16) - log_prior)
         if self.normalize_kl:     
             return kl_div.sum(-1).view(preds.size(0), -1).mean(dim=1)
         elif self.normalize_kl_per_var:
@@ -248,7 +252,7 @@ class DNRI(nn.Module):
 
     def kl_categorical_avg(self, preds, eps=1e-16):
         avg_preds = preds.mean(dim=2)
-        kl_div = avg_preds*(torch.log(avg_preds+eps) - self.log_prior)
+        kl_div = avg_preds * (torch.log(avg_preds + eps) - self.log_prior)
         if self.normalize_kl:     
             return kl_div.sum(-1).view(preds.size(0), -1).mean(dim=1)
         elif self.normalize_kl_per_var:
