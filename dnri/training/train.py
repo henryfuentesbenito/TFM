@@ -4,17 +4,13 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from . import train_utils
 import dnri.utils.misc as misc
-
 import time, os
-import random
 import numpy as np
 
 def train(model, train_data, val_data, params, train_writer, val_writer):
     gpu = params.get('gpu', False)
     batch_size = params.get('batch_size', 1000)
     val_batch_size = params.get('val_batch_size', batch_size)
-    if val_batch_size is None:
-        val_batch_size = batch_size
     accumulate_steps = params.get('accumulate_steps')
     training_scheduler = params.get('training_scheduler', None)
     num_epochs = params.get('num_epochs', 100)
@@ -34,18 +30,6 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
     wd = params.get('wd', 0.)
     mom = params.get('mom', 0.)
     
-    # Calcular las frecuencias de las clases en los datos de entrenamiento
-    # Esto asume que los datos de entrenamiento contienen 'edges' que son las etiquetas de clase
-    class_counts = torch.zeros(2)  # Asumimos dos clases (0 y 1)
-    for batch in train_data_loader:
-        edges = batch['edges'].view(-1)
-        class_counts += torch.bincount(edges, minlength=2)
-    
-    # Invertir las frecuencias para obtener los pesos
-    class_weights = 1.0 / (class_counts + 1e-6)  # Evitar división por cero
-    class_weights = class_weights / class_weights.sum()  # Normalizar para que sumen 1
-    class_weights = class_weights.to(gpu) if gpu else class_weights
-
     model_params = [param for param in model.parameters() if param.requires_grad]
     if params.get('use_adam', False):
         opt = torch.optim.Adam(model_params, lr=lr, weight_decay=wd)
@@ -64,12 +48,15 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         opt.load_state_dict(train_params['optimizer'])
         best_val_result = train_params['best_val_result']
         best_val_epoch = train_params['best_val_epoch']
-        print("STARTING EPOCH: ", start_epoch)
+        print("STARTING EPOCH: ",start_epoch)
     else:
         start_epoch = 1
         best_val_epoch = -1
         best_val_result = 10000000
     
+    # Pasa los pesos de las clases al modelo
+    model.class_weights = torch.tensor(params['class_weights'], device='cuda' if gpu else 'cpu')
+
     training_scheduler = train_utils.build_scheduler(opt, params)
     end = start = 0 
     misc.seed(1)
@@ -80,18 +67,13 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         start = time.time() 
         for batch_ind, batch in enumerate(train_data_loader):
             inputs = batch['inputs']
-            edges = batch['edges']
             if gpu:
                 inputs = inputs.cuda(non_blocking=True)
-                edges = edges.cuda(non_blocking=True)
-            
-            # Modificar la función de pérdida para incluir los pesos
-            criterion = nn.CrossEntropyLoss(weight=class_weights)
-            loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(inputs, is_train=True, return_logits=True, criterion=criterion)
+            loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(inputs, is_train=True, return_logits=True)
             loss.backward()
             if verbose:
                 print("\tBATCH %d OF %d: %f, %f, %f"%(batch_ind+1, len(train_data_loader), loss.item(), loss_nll.mean().item(), loss_kl.mean().item()))
-            if accumulate_steps == -1 or (batch_ind+1) % accumulate_steps == 0:
+            if accumulate_steps == -1 or (batch_ind+1)%accumulate_steps == 0:
                 if verbose and accumulate_steps > 0:
                     print("\tUPDATING WEIGHTS")
                 if clip_grad is not None:
@@ -111,7 +93,7 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
             if normalize_nll:
                 train_writer.add_scalar('NLL', loss_nll.mean().item(), global_step=epoch)
             else:
-                train_writer.add_scalar('NLL', loss_nll.mean().item() / (inputs.size(1) * inputs.size(2)), global_step=epoch)
+                train_writer.add_scalar('NLL', loss_nll.mean().item()/(inputs.size(1)*inputs.size(2)), global_step=epoch)
             
             train_writer.add_scalar("KL Divergence", loss_kl.mean().item(), global_step=epoch)
         model.eval()
@@ -124,14 +106,9 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
         with torch.no_grad():
             for batch_ind, batch in enumerate(val_data_loader):
                 inputs = batch['inputs']
-                edges = batch['edges']
                 if gpu:
                     inputs = inputs.cuda(non_blocking=True)
-                    edges = edges.cuda(non_blocking=True)
-                
-                # Usar los mismos pesos para la evaluación
-                criterion = nn.CrossEntropyLoss(weight=class_weights)
-                loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(inputs, is_train=False, teacher_forcing=val_teacher_forcing, return_logits=True, criterion=criterion)
+                loss, loss_nll, loss_kl, logits, _ = model.calculate_loss(inputs, is_train=False, teacher_forcing=val_teacher_forcing, return_logits=True)
                 total_kl += loss_kl.sum().item()
                 total_nll += loss_nll.sum().item()
                 if verbose:
@@ -139,7 +116,7 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
             
         total_kl /= len(val_data)
         total_nll /= len(val_data)
-        total_loss = model.kl_coef * total_kl + total_nll
+        total_loss = model.kl_coef*total_kl + total_nll
         if val_writer is not None:
             val_writer.add_scalar('loss', total_loss, global_step=epoch)
             val_writer.add_scalar("NLL", total_nll, global_step=epoch)
@@ -155,10 +132,10 @@ def train(model, train_data, val_data, params, train_writer, val_writer):
             model.save(best_path)
         model.save(checkpoint_dir)
         torch.save({
-                    'epoch': epoch + 1,
-                    'optimizer': opt.state_dict(),
-                    'best_val_result': best_val_result,
-                    'best_val_epoch': best_val_epoch,
+                    'epoch':epoch+1,
+                    'optimizer':opt.state_dict(),
+                    'best_val_result':best_val_result,
+                    'best_val_epoch':best_val_epoch,
                    }, training_path)
         print("EPOCH %d EVAL: "%epoch)
         print("\tCURRENT VAL LOSS: %f"%tuning_loss)
